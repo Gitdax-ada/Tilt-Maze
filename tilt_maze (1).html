@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tilt Maze</title>
+<style>
+  :root { --bg:#14161c; --panel:#1f232c; --text:#eef0f4; --muted:#9aa3b2; --accent:#4cc38a; --warn:#ff7a6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, sans-serif;
+         display:flex; flex-direction:column; align-items:center; padding:16px; }
+  h1 { margin:4px 0 12px; font-size:2.2rem; letter-spacing:1px; }
+  .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:center;
+         background:var(--panel); padding:10px 14px; border-radius:10px; margin-bottom:10px; }
+  button { background:var(--accent); color:#06120c; border:0; padding:8px 14px; border-radius:8px;
+           font-weight:700; cursor:pointer; font-size:0.95rem; }
+  button.secondary { background:#39404d; color:var(--text); }
+  label { color:var(--muted); font-size:0.9rem; cursor:pointer; }
+  #status { color:var(--muted); font-size:0.9rem; }
+  .hud { display:flex; gap:28px; font-size:1.4rem; font-weight:700; margin:6px 0 10px; }
+  .hud span small { color:var(--muted); font-weight:400; font-size:0.9rem; margin-right:6px; }
+  canvas { width:min(100%, 900px); height:auto; border-radius:12px; box-shadow:0 10px 40px #0008; }
+  #msg { min-height:2.2em; margin-top:12px; font-size:1.5rem; font-weight:700; text-align:center; }
+  .help { color:var(--muted); font-size:0.9rem; margin-top:4px; text-align:center; }
+</style>
+</head>
+<body>
+<h1>Tilt Maze</h1>
+
+<div class="bar">
+  <button id="connect">Connect Arduino</button>
+  <span id="status">Not connected (arrow keys work for testing)</span>
+  <button id="calib" class="secondary">Calibrate (C)</button>
+  <button id="pause" class="secondary">Pause (P)</button>
+  <label><input type="checkbox" id="flipX"> Flip X</label>
+  <label><input type="checkbox" id="flipY" checked> Flip Y</label>
+  <label><input type="checkbox" id="swap"> Swap X/Y</label>
+</div>
+
+<div class="hud">
+  <span><small>Level</small><span id="level">1</span></span>
+  <span><small>Time</small><span id="timer">0.00</span></span>
+  <span><small>Best</small><span id="best">--</span></span>
+</div>
+
+<canvas id="c" width="600" height="440"></canvas>
+<div id="msg">Guide the ball to the green goal. Avoid the holes!</div>
+<div class="help">P = pause &nbsp;·&nbsp; R = restart level &nbsp;·&nbsp; SPACE = next level after winning &nbsp;·&nbsp; C = calibrate center</div>
+
+<script>
+// ---------- Mazes: # wall, . floor, S start, G goal, O hole ----------
+const LEVELS = [
+  [
+    "###############",
+    "#S....#.......#",
+    "#.###.#.#####.#",
+    "#.#...#.#...#.#",
+    "#.#.###.#.#.#.#",
+    "#.#.....#.#...#",
+    "#.#######.###.#",
+    "#.......#...#.#",
+    "#######.###.#.#",
+    "#...........#G#",
+    "###############"
+  ],
+  [
+    "###############",
+    "#S.....O......#",
+    "#.###.....###.#",
+    "#...#.#O#.#...#",
+    "###.#.#.#.#.###",
+    "#O..#...#...O.#",
+    "#.#####.#####.#",
+    "#...O.......#.#",
+    "#.#####.###.#.#",
+    "#.......#O...G#",
+    "###############"
+  ]
+];
+
+const T = 40;            // tile size in pixels
+const R = 10;            // ball radius
+const ACCEL = 900;       // how strongly tilt pushes the ball
+const MAX_SPEED = 380;
+const FRICTION = 1.6;    // higher = ball slows down faster
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const $ = id => document.getElementById(id);
+
+let level = 0, grid, startPos, ball, state, startTime, finishTime, fellAt;
+
+// ---------- Best times (saved in this browser) ----------
+function loadBest(n) {
+  try { const v = localStorage.getItem("tiltmaze_best_" + n); return v ? parseFloat(v) : null; }
+  catch (e) { return null; }
+}
+function saveBest(n, t) {
+  try { localStorage.setItem("tiltmaze_best_" + n, String(t)); } catch (e) {}
+}
+
+function loadLevel(n) {
+  level = n;
+  if (typeof paused !== "undefined" && paused) { paused = false; $("pause").textContent = "Pause (P)"; }
+  grid = LEVELS[n].map(row => row.split(""));
+  for (let r = 0; r < grid.length; r++)
+    for (let c = 0; c < grid[r].length; c++)
+      if (grid[r][c] === "S") startPos = { x: c * T + T / 2, y: r * T + T / 2 };
+  resetBall();
+  state = "playing";
+  startTime = performance.now();
+  $("level").textContent = n + 1;
+  const b = loadBest(n);
+  $("best").textContent = b ? b.toFixed(2) : "--";
+  $("msg").textContent = n === 0 ? "Guide the ball to the green goal!" : "Watch out for the holes!";
+  $("msg").style.color = "var(--text)";
+}
+
+function resetBall() { ball = { x: startPos.x, y: startPos.y, vx: 0, vy: 0 }; }
+
+// ---------- Input: Arduino + keyboard ----------
+let raw = { x: 512, y: 512 }, center = { x: 512, y: 512 }, arduinoOn = false;
+const keys = {};
+
+addEventListener("keydown", e => {
+  keys[e.key] = true;
+  if (e.key === "r" || e.key === "R") loadLevel(level);
+  if (e.key === "c" || e.key === "C") calibrate();
+  if (e.key === "p" || e.key === "P" || e.key === "Escape") togglePause();
+  if (e.key === " " && state === "won") loadLevel((level + 1) % LEVELS.length);
+  if (e.key.startsWith("Arrow") || e.key === " ") e.preventDefault();
+});
+addEventListener("keyup", e => { keys[e.key] = false; });
+canvas.addEventListener("click", () => { if (state === "won") loadLevel((level + 1) % LEVELS.length); });
+
+function calibrate() {
+  center = { x: raw.x, y: raw.y };
+  if (arduinoOn) $("status").textContent = "Connected. Center calibrated!";
+}
+$("calib").onclick = calibrate;
+
+// ---------- Pause ----------
+let paused = false, pausedAt = 0, savedMsg = "", savedColor = "";
+function togglePause() {
+  if (state !== "playing" && !paused) return;   // nothing to pause after winning
+  paused = !paused;
+  if (paused) {
+    pausedAt = performance.now();
+    savedMsg = $("msg").textContent; savedColor = $("msg").style.color;
+    $("msg").textContent = "Paused. Press P or the Resume button to keep playing.";
+    $("msg").style.color = "var(--text)";
+    $("pause").textContent = "Resume (P)";
+  } else {
+    startTime += performance.now() - pausedAt;  // paused time doesn't count
+    $("msg").textContent = savedMsg; $("msg").style.color = savedColor;
+    $("pause").textContent = "Pause (P)";
+  }
+  $("pause").blur();
+}
+$("pause").onclick = togglePause;
+
+function getTilt() {
+  let tx = 0, ty = 0;
+  if (arduinoOn) {
+    tx = (raw.x - center.x) / 512;
+    ty = (raw.y - center.y) / 512;
+    if ($("swap").checked) [tx, ty] = [ty, tx];
+    if ($("flipX").checked) tx = -tx;
+    if ($("flipY").checked) ty = -ty;
+    if (Math.abs(tx) < 0.08) tx = 0;   // dead zone so it doesn't drift
+    if (Math.abs(ty) < 0.08) ty = 0;
+  }
+  if (keys.ArrowLeft || keys.a) tx -= 1;
+  if (keys.ArrowRight || keys.d) tx += 1;
+  if (keys.ArrowUp || keys.w) ty -= 1;
+  if (keys.ArrowDown || keys.s) ty += 1;
+  return { x: Math.max(-1, Math.min(1, tx)), y: Math.max(-1, Math.min(1, ty)) };
+}
+
+// ---------- Arduino connection (Web Serial, Chrome/Edge) ----------
+$("connect").onclick = async () => {
+  if (!("serial" in navigator)) {
+    alert("Please open this file in Google Chrome or Microsoft Edge to connect the Arduino.");
+    return;
+  }
+  try {
+    const port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    $("status").textContent = "Connected!";
+    $("connect").textContent = "Connected";
+    $("connect").disabled = true;
+    readLoop(port);
+  } catch (e) {
+    $("status").textContent = "Could not connect. Close the Arduino Serial Monitor and try again.";
+  }
+};
+
+async function readLoop(port) {
+  const decoder = new TextDecoderStream();
+  port.readable.pipeTo(decoder.writable);
+  const reader = decoder.readable.getReader();
+  let buf = "", first = true;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        const parts = line.trim().split(",");
+        if (parts.length !== 2) continue;
+        const x = parseInt(parts[0]), y = parseInt(parts[1]);
+        if (isNaN(x) || isNaN(y)) continue;
+        raw = { x, y };
+        if (first) { center = { x, y }; first = false; }  // auto-calibrate on connect
+        arduinoOn = true;
+      }
+    }
+  } catch (e) {
+    $("status").textContent = "Arduino disconnected. Reload the page to reconnect.";
+    arduinoOn = false;
+  }
+}
+
+// ---------- Physics ----------
+function tileAt(c, r) {
+  if (r < 0 || r >= grid.length || c < 0 || c >= grid[0].length) return "#";
+  return grid[r][c];
+}
+
+function hitsWall(x, y) {
+  const c0 = Math.floor((x - R) / T), c1 = Math.floor((x + R) / T);
+  const r0 = Math.floor((y - R) / T), r1 = Math.floor((y + R) / T);
+  for (let r = r0; r <= r1; r++)
+    for (let c = c0; c <= c1; c++) {
+      if (tileAt(c, r) !== "#") continue;
+      const nx = Math.max(c * T, Math.min(x, c * T + T));
+      const ny = Math.max(r * T, Math.min(y, r * T + T));
+      if ((x - nx) ** 2 + (y - ny) ** 2 < R * R) return true;
+    }
+  return false;
+}
+
+function update(dt) {
+  if (paused) return;
+  if (state === "fell") {
+    if (performance.now() - fellAt > 900) { resetBall(); state = "playing"; $("msg").textContent = "Try again!"; $("msg").style.color = "var(--text)"; }
+    return;
+  }
+  if (state !== "playing") return;
+
+  const tilt = getTilt();
+  ball.vx += tilt.x * ACCEL * dt;
+  ball.vy += tilt.y * ACCEL * dt;
+  const f = Math.max(0, 1 - FRICTION * dt);
+  ball.vx *= f; ball.vy *= f;
+  const sp = Math.hypot(ball.vx, ball.vy);
+  if (sp > MAX_SPEED) { ball.vx *= MAX_SPEED / sp; ball.vy *= MAX_SPEED / sp; }
+
+  // Move in small steps so the ball never skips through a wall
+  const steps = Math.max(1, Math.ceil(sp * dt / 4));
+  for (let i = 0; i < steps; i++) {
+    const mx = ball.vx * dt / steps, my = ball.vy * dt / steps;
+    ball.x += mx;
+    if (hitsWall(ball.x, ball.y)) { ball.x -= mx; ball.vx *= -0.3; }
+    ball.y += my;
+    if (hitsWall(ball.x, ball.y)) { ball.y -= my; ball.vy *= -0.3; }
+  }
+
+  // Check holes and goal
+  const c = Math.floor(ball.x / T), r = Math.floor(ball.y / T);
+  const t = tileAt(c, r);
+  const d = Math.hypot(ball.x - (c * T + T / 2), ball.y - (r * T + T / 2));
+  if (t === "O" && d < 13) {
+    state = "fell"; fellAt = performance.now();
+    $("msg").textContent = "Oops! You fell in a hole!"; $("msg").style.color = "var(--warn)";
+  } else if (t === "G" && d < 15) {
+    state = "won";
+    finishTime = (performance.now() - startTime) / 1000;
+    const best = loadBest(level);
+    let text = "You made it in " + finishTime.toFixed(2) + " seconds!";
+    if (!best || finishTime < best) { saveBest(level, finishTime); $("best").textContent = finishTime.toFixed(2); text += " NEW RECORD!"; }
+    text += level === LEVELS.length - 1 ? " You beat every level! (SPACE to play again)" : " Press SPACE for the next level.";
+    $("msg").textContent = text; $("msg").style.color = "var(--accent)";
+  }
+}
+
+// ---------- Drawing ----------
+function draw() {
+  for (let r = 0; r < grid.length; r++)
+    for (let c = 0; c < grid[r].length; c++) {
+      const x = c * T, y = r * T, t = grid[r][c];
+      if (t === "#") {
+        ctx.fillStyle = "#3a2a1c"; ctx.fillRect(x, y, T, T);
+        ctx.fillStyle = "#4d3826"; ctx.fillRect(x + 2, y + 2, T - 4, T - 4);
+      } else {
+        ctx.fillStyle = (r + c) % 2 ? "#d9b98a" : "#d3b283"; ctx.fillRect(x, y, T, T);
+        if (t === "O") {
+          const g = ctx.createRadialGradient(x + T / 2, y + T / 2, 2, x + T / 2, y + T / 2, 15);
+          g.addColorStop(0, "#000"); g.addColorStop(1, "#2a1a10");
+          ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x + T / 2, y + T / 2, 15, 0, Math.PI * 2); ctx.fill();
+        }
+        if (t === "G") {
+          ctx.fillStyle = "#2fae6f"; ctx.beginPath(); ctx.arc(x + T / 2, y + T / 2, 16, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = "#fff"; ctx.font = "bold 13px system-ui"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          ctx.fillText("GOAL", x + T / 2, y + T / 2);
+        }
+        if (t === "S") {
+          ctx.strokeStyle = "#8a6d45"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x + T / 2, y + T / 2, 14, 0, Math.PI * 2); ctx.stroke();
+        }
+      }
+    }
+
+  // Ball (shrinks when falling in a hole)
+  let radius = R;
+  if (state === "fell") radius = R * Math.max(0.1, 1 - (performance.now() - fellAt) / 500);
+  ctx.fillStyle = "rgba(0,0,0,0.25)";
+  ctx.beginPath(); ctx.arc(ball.x + 3, ball.y + 4, radius, 0, Math.PI * 2); ctx.fill();
+  const g = ctx.createRadialGradient(ball.x - 3, ball.y - 4, 1, ball.x, ball.y, radius);
+  g.addColorStop(0, "#ffffff"); g.addColorStop(0.4, "#c8ccd4"); g.addColorStop(1, "#5d6470");
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(ball.x, ball.y, radius, 0, Math.PI * 2); ctx.fill();
+
+  // Timer (frozen while paused)
+  const now = paused ? pausedAt : performance.now();
+  const t = state === "won" ? finishTime : (now - startTime) / 1000;
+  $("timer").textContent = t.toFixed(2);
+
+  // Pause screen
+  if (paused) {
+    ctx.fillStyle = "rgba(10,12,16,0.6)"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = "bold 56px system-ui"; ctx.fillText("PAUSED", canvas.width / 2, canvas.height / 2 - 14);
+    ctx.font = "20px system-ui"; ctx.fillText("Press P to resume", canvas.width / 2, canvas.height / 2 + 34);
+  }
+}
+
+// ---------- Game loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+loadLevel(0);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
